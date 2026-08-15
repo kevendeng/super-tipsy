@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Fantacy 审查助手",
+  "version": "2.0",
+  "description": "列表页悬停某行按 A=通过、D=拒绝;详情页同样 A/D 决策;支持字符/多字符列表页。",
+  "content_scripts": [
+    {
+      "matches": ["https://admin.fantacy.live/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
