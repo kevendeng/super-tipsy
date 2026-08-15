@@ -1,4 +1,4 @@
-// Fantacy 审查助手
+// 审核小助手
 // 列表页:自动点开最上方的「审查」。
 // 详情页:按 A=批准(通过)、D=拒绝。完成后网站自动回列表页,再自动点开下一个。
 
@@ -438,7 +438,7 @@
     if (!panelEl) buildPanel();
     if (panelEl.style.display !== "flex") panelEl.style.display = "flex";
     // 幂等:文字没变就不动 DOM,避免无谓重写引发抖动
-    const label = "审查助手 " + VERSION + " · " + currentMsg;
+    const label = "审核小助手 " + VERSION + " · " + currentMsg;
     if (label !== _lastLabel) {
       labelEl.textContent = label;
       _lastLabel = label;
