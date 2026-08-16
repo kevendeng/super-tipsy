@@ -5,7 +5,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "v2.1"; // 改代码时记得 +1,方便确认是否生效
+  const VERSION = "v3.6"; // 改代码时记得 +1,方便确认是否生效
   const CLICK_COOLDOWN = 1500; // 同一动作的最小间隔,防连点
   let lastReviewClickAt = 0;
   let lastDecisionAt = 0;
@@ -158,8 +158,10 @@
     highlightRow(el ? findRowFrom(el) : null);
   }
 
-  // ===== 预览图:靠向头像派发合成的鼠标悬停事件,触发网站自带的预览弹层 =====
-  let previewedEl = null; // 当前被“假装悬停”的头像元素,便于之后清除
+  // ===== 预览图:自绘一个固定在屏幕最右侧的预览框,永远不挡列表信息 =====
+  // 不再驱动网站自带的左侧悬停弹层(它位置固定在头像旁、会挡住信息)。
+  let previewBox = null;
+  let previewRow = null; // 当前预览跟随的行,供滚动/重排时实时重定位
 
   // 找某行的头像元素(优先 src 含 /character/avatar/ 的图,兜底取行内第一张可见图)
   function findRowAvatar(row) {
@@ -170,17 +172,97 @@
     );
   }
 
-  // 向元素(及其父级)派发一组进入类事件
+  function ensurePreviewBox() {
+    if (previewBox && document.body.contains(previewBox)) return previewBox;
+    previewBox = document.createElement("div");
+    previewBox.id = "__tipsy_preview__";
+    // 位置(left/top/width/height)在每次预览时由 positionPreviewUnderRow 动态设置,
+    // 让预览图出现在“选中行正下方、左侧列”,占住下面两行的位置。
+    previewBox.style.cssText = [
+      "position:fixed",
+      "z-index:2147483646",
+      "background:#000",
+      "border:2px solid #2e7d32",
+      "border-radius:8px",
+      "box-shadow:0 6px 24px rgba(0,0,0,.5)",
+      "overflow:hidden",
+      "display:none",
+      "pointer-events:none", // 不拦截鼠标,方便继续操作页面
+    ].join(";");
+    const img = document.createElement("img");
+    // 图片按自身比例显示,宽/高上限由 positionPreviewUnderRow 动态设置,
+    // 两个上限内等比缩放,保证完整不截断。
+    img.style.cssText = "display:block;height:auto;width:auto;";
+    previewBox.appendChild(img);
+    document.body.appendChild(previewBox);
+
+    // 注入样式:仅在“假悬停读图”期间隐藏网站自带 tooltip(图仍会加载),避免头像旁闪一下。
+    // 你手动悬停头像时页面没有这个 class,tooltip 照常显示,不受影响。
+    if (!document.getElementById("__tipsy_preview_style__")) {
+      const st = document.createElement("style");
+      st.id = "__tipsy_preview_style__";
+      st.textContent =
+        "html.__tipsy_hide_tip__ .MuiTooltip-popper{opacity:0!important;pointer-events:none!important;}";
+      document.head.appendChild(st);
+    }
+    return previewBox;
+  }
+
+  // 关掉预览框
+  function clearPreview() {
+    previewRow = null;
+    if (previewBox) previewBox.style.display = "none";
+  }
+
+  // 预览框跟随行:滚动或 DOM 重排会改变行的位置,实时把预览框贴回行下方。
+  // 行已从列表移除(如审核完被删)→ 关掉预览,避免留在原地盖住列表。
+  function repositionPreview() {
+    if (!previewBox || previewBox.style.display === "none" || !previewRow) return;
+    if (!document.body.contains(previewRow) || !getRows().includes(previewRow)) {
+      clearPreview();
+      return;
+    }
+    positionPreviewUnderRow(previewRow, previewBox);
+  }
+  // 滚动/尺寸变化时实时跟随(capture:true 以捕获内部滚动容器的滚动)
+  window.addEventListener("scroll", repositionPreview, true);
+  window.addEventListener("resize", repositionPreview, true);
+
+  // 把预览框定位到“选中行正下方、左侧列”,向下铺开占住下面的空间。
+  function positionPreviewUnderRow(row, box) {
+    if (!row || !box) return;
+    const r = row.getBoundingClientRect();
+    const gap = 8;
+    const left = Math.max(8, r.left);
+    const top = r.bottom + gap;
+    // 宽度:跟随行左侧信息区宽度(约到 AI 评分区之前),这里取行宽的 ~40%,并限制范围
+    // 可用宽度:约行宽的 40%(左侧列),限制范围;
+    // 可用高度:从行底一直到接近视口底部。
+    const maxWidth = Math.min(460, Math.max(280, r.width * 0.4));
+    // 高度封顶:最多铺到视口底部,但也不超过 520px,避免竖图把整条左列铺满、盖住下方行。
+    const maxHeight = Math.min(520, Math.max(200, window.innerHeight - top - 12));
+    // 框自适应图片大小(auto),把约束加到图片上,让图在两个上限内等比完整显示。
+    box.style.left = left + "px";
+    box.style.top = top + "px";
+    box.style.width = "auto";
+    box.style.height = "auto";
+    const img = box.querySelector("img");
+    if (img) {
+      img.style.maxWidth = maxWidth + "px";
+      img.style.maxHeight = maxHeight + "px";
+    }
+  }
+
+  // 向元素(及其父级)派发一组鼠标/指针事件,用来“假装悬停”头像,
+  // 促使网站把高清大图加载进它自带的 tooltip(.MuiTooltip-popper)。
   function fireHoverEvents(el, types) {
     const r = el.getBoundingClientRect();
-    const cx = r.left + r.width / 2;
-    const cy = r.top + r.height / 2;
     const base = {
       bubbles: true,
       cancelable: true,
       view: window,
-      clientX: cx,
-      clientY: cy,
+      clientX: r.left + r.width / 2,
+      clientY: r.top + r.height / 2,
     };
     const targets = [el, el.parentElement].filter(Boolean);
     types.forEach((type) => {
@@ -198,25 +280,39 @@
     });
   }
 
-  // 关掉当前预览(向上次的头像派发离开类事件)
-  function clearPreview() {
-    if (!previewedEl) return;
-    try {
-      fireHoverEvents(previewedEl, [
-        "pointerout",
-        "pointerleave",
-        "mouseout",
-        "mouseleave",
-      ]);
-    } catch (e) {}
-    previewedEl = null;
+  // 从网站 tooltip 里读高清大图地址(/character/image/ 优先)
+  function readTooltipImageSrc() {
+    const imgs = Array.from(
+      document.querySelectorAll(".MuiTooltip-popper img")
+    ).filter(isVisible);
+    if (!imgs.length) return null;
+    const hi = imgs.find((im) =>
+      /\/character\/image\//i.test(im.currentSrc || im.src)
+    );
+    const chosen = hi || imgs[imgs.length - 1];
+    return chosen ? chosen.currentSrc || chosen.src : null;
   }
 
-  // 触发某行头像的预览
+  // 每次切行的令牌:防止上一行的异步轮询把图写错到当前框
+  let previewToken = 0;
+
+  // 显示某行头像的高清预览(固定在右侧)
   function triggerPreview(row) {
+    const myToken = ++previewToken;
     const av = findRowAvatar(row);
-    if (!av) return;
-    previewedEl = av;
+    if (!av) {
+      clearPreview();
+      return;
+    }
+    const box = ensurePreviewBox();
+    const img = box.querySelector("img");
+
+    // 不用小头像占位,避免“先缩略图后高清图”的闪切;
+    // 保持当前框内容不变,直到高清图读到再替换显示。
+
+    // 假装悬停头像 → 触发网站加载高清图到 tooltip。
+    // 先挂 class 把网站 tooltip 隐藏,避免头像旁闪一下(图仍会加载)。
+    document.documentElement.classList.add("__tipsy_hide_tip__");
     fireHoverEvents(av, [
       "pointerover",
       "pointerenter",
@@ -224,6 +320,50 @@
       "mouseenter",
       "mousemove",
     ]);
+
+    const endFakeHover = () => {
+      fireHoverEvents(av, [
+        "pointerout",
+        "pointerleave",
+        "mouseout",
+        "mouseleave",
+      ]);
+      // 稍等 tooltip 收起后再撤 class,避免撤早了又闪一下
+      setTimeout(
+        () => document.documentElement.classList.remove("__tipsy_hide_tip__"),
+        150
+      );
+    };
+
+    // tooltip 与大图加载都是异步,轮询几次去读地址
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (myToken !== previewToken) {
+        clearInterval(timer);
+        endFakeHover(); // 已切到别的行:撤掉本次假悬停
+        return;
+      }
+      const hi = readTooltipImageSrc();
+      if (hi) {
+        img.onload = () => {
+          if (myToken === previewToken) positionPreviewUnderRow(row, box);
+        };
+        img.src = hi;
+        previewRow = row; // 记住跟随的行,滚动/重排时实时重定位
+        positionPreviewUnderRow(row, box); // 定位到选中行正下方
+        box.style.display = "block";
+        // 平滑滚动可能未结束,稍后再校准一次位置
+        setTimeout(() => {
+          if (myToken === previewToken) positionPreviewUnderRow(row, box);
+        }, 350);
+        clearInterval(timer);
+        endFakeHover(); // 读到高清图,撤掉假悬停
+      } else if (++tries >= 20) {
+        // ~2s 还没读到,放弃(保留小头像占位)
+        clearInterval(timer);
+        endFakeHover();
+      }
+    }, 100);
   }
 
   // 取当前列表页所有可选行(文档顺序)
@@ -236,13 +376,52 @@
     );
   }
 
-  // 选中某行:高亮 + 滚动到中间 + 触发预览
+  // 顶部固定栏的底边 = “创建者UID / 角色ID / 审查小组 / 搜索”那一行的底部。
+  // 直接量这一行的实际底边(它固定在头部),选中行顶部对齐到它下面即可。
+  function getTopBarBottom() {
+    // 锚点:搜索栏那一行里的“搜索”按钮,取它所在那一行的底边。
+    const searchBtn = Array.from(
+      document.querySelectorAll("button.MuiButton-colorPrimary, button")
+    ).find((b) => isVisible(b) && /^(搜索|search)$/i.test(btnText(b)));
+    if (searchBtn) {
+      // 用按钮向上找到那一整行(含 UID / 角色ID / 审查小组 的容器),取其底边。
+      const rowBar = searchBtn.closest("div");
+      const el = rowBar || searchBtn;
+      const b = el.getBoundingClientRect().bottom;
+      if (b > 0 && b < window.innerHeight * 0.5) return b;
+    }
+    return 200; // 兜底
+  }
+
+  // 找到真正带滚动条的祖先容器(列表可能在内部滚动区里滚,而不是整个窗口)。
+  // 返回 null 表示用窗口滚动。
+  function getScrollParent(el) {
+    let node = el ? el.parentElement : null;
+    while (node && node !== document.body && node !== document.documentElement) {
+      const cs = getComputedStyle(node);
+      const oy = cs.overflowY;
+      if ((oy === "auto" || oy === "scroll") && node.scrollHeight > node.clientHeight + 4) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return null; // 用 window
+  }
+
+  // 选中某行:高亮 + 把该行顶部滚到搜索栏正下方 + 触发预览。
+  // 量搜索栏底边算出差值,直接滚到“正确的滚动容器”上,一次到位,不猜高度。
   function selectRow(row) {
     highlightRow(row); // 内部已 clearPreview
-    if (row) {
-      row.scrollIntoView({ block: "center", behavior: "smooth" });
-      triggerPreview(row);
+    if (!row) return;
+    const target = getTopBarBottom() + 8; // 目标:行顶距视口顶部 = 顶栏底边 + 一点间距
+    const delta = row.getBoundingClientRect().top - target; // >0:行在目标下方,需向下滚
+    const sc = getScrollParent(row);
+    if (sc) {
+      sc.scrollTo({ top: sc.scrollTop + delta, behavior: "smooth" });
+    } else {
+      window.scrollBy({ top: delta, behavior: "smooth" });
     }
+    triggerPreview(row);
   }
 
   // ↑/↓ 移动选中行
@@ -278,8 +457,68 @@
     }
     lastRowDecisionAt = now;
     setStatus(kind === "approve" ? "✅ 已通过(当前行)" : "❌ 已拒绝(当前行)");
+    // 记录当前行索引:决行后该行通常从列表移除,下一个待审行会顶到同一索引。
+    const rowsBefore = getRows();
+    const decidedIdx = rowsBefore.indexOf(hoverRow);
     btn.click();
+    // 等列表重排后,自动选中下一个待审行并弹预览(体验和按 ↓ 一致)。
+    advanceAfterDecision(decidedIdx);
     return true;
+  }
+
+  // 决行后前进到下一行。关键:上下键能稳,是因为选行时列表是静止的。
+  // 这里网站决行后会继续重渲染(删行 → 重排/拉下一批),若在“行数刚变”的瞬间就选行,
+  // selectRow 记住的行随即被 React 换成新节点,后续读图/滚动全在动的列表上算坐标 → 乱跑。
+  // 所以:先等列表发生变化,再等它连续几次“行数不再变”(彻底静止),
+  // 之后才走与上下键完全相同的 selectRow —— 此刻 DOM 和按上下键时一样是静止的。
+  function advanceAfterDecision(decidedIdx) {
+    if (decidedIdx < 0) return;
+    const beforeCount = getRows().length;
+    hoverRow = null; // 让 selectRow/highlightRow 一定重新走高亮+预览
+    clearPreview(); // 先撤掉旧预览,别让它在重排期间乱铺
+    let tries = 0;
+    let changed = false;
+    let lastCount = beforeCount;
+    let stableFor = 0; // 连续多少次行数没变
+    const timer = setInterval(() => {
+      tries++;
+      const rows = getRows();
+      if (!changed) {
+        // 第一步:等列表真正变化(有行被处理掉)
+        if (rows.length !== beforeCount) {
+          changed = true;
+          lastCount = rows.length;
+          stableFor = 0;
+        } else if (tries >= 20) {
+          // 3s 还没变:兜底直接按原索引选
+          clearInterval(timer);
+          finish(rows);
+        }
+        return;
+      }
+      // 第二步:等列表静止(连续 3 次 ~450ms 行数不变)
+      if (rows.length === lastCount) {
+        stableFor++;
+      } else {
+        lastCount = rows.length;
+        stableFor = 0;
+      }
+      if (stableFor >= 3 || tries >= 40) {
+        clearInterval(timer);
+        finish(rows);
+      }
+    }, 150);
+
+    function finish(rows) {
+      rows = getRows(); // 用最新的
+      if (!rows.length) {
+        setStatus("本页已无待审行");
+        return;
+      }
+      const idx = Math.max(0, Math.min(rows.length - 1, decidedIdx));
+      selectRow(rows[idx]); // 与上下键同一路径,此刻 DOM 已静止
+      setStatus("已选中第 " + (idx + 1) + " / " + rows.length + " 行");
+    }
   }
 
   document.addEventListener(
@@ -291,6 +530,7 @@
         if (hoverRow) highlightRow(null);
         return;
       }
+      if (paused) return; // 暂停中:不高亮、不预览,防误触
       const row = findRowFrom(e.target);
       if (row !== hoverRow) {
         highlightRow(row); // 鼠标换行:高亮(不强制滚动)
@@ -391,6 +631,7 @@
       if (tag === "input" || tag === "textarea" || e.target.isContentEditable)
         return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (paused) return; // 暂停中:不响应任何快捷键,防误触
 
       // 列表页:↑/↓ 切换选中行并预览;A/D 对当前选中行决策
       if (isListPage()) {
