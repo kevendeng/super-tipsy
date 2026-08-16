@@ -5,7 +5,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "v2.0"; // 改代码时记得 +1,方便确认是否生效
+  const VERSION = "v2.1"; // 改代码时记得 +1,方便确认是否生效
   const CLICK_COOLDOWN = 1500; // 同一动作的最小间隔,防连点
   let lastReviewClickAt = 0;
   let lastDecisionAt = 0;
@@ -140,10 +140,11 @@
     ).find(isVisible);
   }
 
-  // 高亮当前悬停行
+  // 高亮当前选中行(鼠标或键盘都会走到这)
   function highlightRow(row) {
     if (hoverRow === row) return;
     if (hoverRow) hoverRow.style.outline = "";
+    clearPreview(); // 换行时先关掉上一张预览
     hoverRow = row;
     if (hoverRow) {
       hoverRow.style.outline = "2px solid #2e7d32";
@@ -155,6 +156,107 @@
   function refreshHoverRow() {
     const el = document.elementFromPoint(lastMouseX, lastMouseY);
     highlightRow(el ? findRowFrom(el) : null);
+  }
+
+  // ===== 预览图:靠向头像派发合成的鼠标悬停事件,触发网站自带的预览弹层 =====
+  let previewedEl = null; // 当前被“假装悬停”的头像元素,便于之后清除
+
+  // 找某行的头像元素(优先 src 含 /character/avatar/ 的图,兜底取行内第一张可见图)
+  function findRowAvatar(row) {
+    if (!row) return null;
+    const imgs = Array.from(row.querySelectorAll("img")).filter(isVisible);
+    return (
+      imgs.find((im) => /\/character\/avatar\//i.test(im.src)) || imgs[0] || null
+    );
+  }
+
+  // 向元素(及其父级)派发一组进入类事件
+  function fireHoverEvents(el, types) {
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: cx,
+      clientY: cy,
+    };
+    const targets = [el, el.parentElement].filter(Boolean);
+    types.forEach((type) => {
+      targets.forEach((t) => {
+        let ev;
+        try {
+          ev = type.startsWith("pointer")
+            ? new PointerEvent(type, base)
+            : new MouseEvent(type, base);
+        } catch (e) {
+          ev = new MouseEvent(type.replace("pointer", "mouse"), base);
+        }
+        t.dispatchEvent(ev);
+      });
+    });
+  }
+
+  // 关掉当前预览(向上次的头像派发离开类事件)
+  function clearPreview() {
+    if (!previewedEl) return;
+    try {
+      fireHoverEvents(previewedEl, [
+        "pointerout",
+        "pointerleave",
+        "mouseout",
+        "mouseleave",
+      ]);
+    } catch (e) {}
+    previewedEl = null;
+  }
+
+  // 触发某行头像的预览
+  function triggerPreview(row) {
+    const av = findRowAvatar(row);
+    if (!av) return;
+    previewedEl = av;
+    fireHoverEvents(av, [
+      "pointerover",
+      "pointerenter",
+      "mouseover",
+      "mouseenter",
+      "mousemove",
+    ]);
+  }
+
+  // 取当前列表页所有可选行(文档顺序)
+  function getRows() {
+    return Array.from(document.querySelectorAll("div.border-b")).filter(
+      (n) =>
+        /\bflex\b/.test(n.className) &&
+        isVisible(n) &&
+        (findRowApprove(n) || findRowReject(n))
+    );
+  }
+
+  // 选中某行:高亮 + 滚动到中间 + 触发预览
+  function selectRow(row) {
+    highlightRow(row); // 内部已 clearPreview
+    if (row) {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      triggerPreview(row);
+    }
+  }
+
+  // ↑/↓ 移动选中行
+  function moveSelection(delta) {
+    const rows = getRows();
+    if (!rows.length) {
+      setStatus("本页没有可选的行");
+      return;
+    }
+    let idx = hoverRow ? rows.indexOf(hoverRow) : -1;
+    if (idx === -1) idx = delta > 0 ? -1 : 0; // 尚未选中:↓选第一行,↑也从第一行起
+    idx = Math.max(0, Math.min(rows.length - 1, idx + delta));
+    selectRow(rows[idx]);
+    setStatus("已选中第 " + (idx + 1) + " / " + rows.length + " 行");
   }
 
   // 列表页按行决策
@@ -189,7 +291,11 @@
         if (hoverRow) highlightRow(null);
         return;
       }
-      highlightRow(findRowFrom(e.target));
+      const row = findRowFrom(e.target);
+      if (row !== hoverRow) {
+        highlightRow(row); // 鼠标换行:高亮(不强制滚动)
+        if (row) triggerPreview(row); // 也触发预览,和键盘选择体验一致
+      }
     },
     true
   );
@@ -285,15 +391,29 @@
       if (tag === "input" || tag === "textarea" || e.target.isContentEditable)
         return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const k = e.key.toLowerCase();
-      if (k !== "a" && k !== "d") return;
 
-      // 列表页:按鼠标当前所在行决策(点该行的 经过/拒绝)
+      // 列表页:↑/↓ 切换选中行并预览;A/D 对当前选中行决策
       if (isListPage()) {
-        e.preventDefault();
-        decideRow(k === "a" ? "approve" : "reject");
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          moveSelection(1);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          moveSelection(-1);
+          return;
+        }
+        const kk = e.key.toLowerCase();
+        if (kk === "a" || kk === "d") {
+          e.preventDefault();
+          decideRow(kk === "a" ? "approve" : "reject");
+        }
         return;
       }
+
+      const k = e.key.toLowerCase();
+      if (k !== "a" && k !== "d") return;
 
       // 详情页:仅在未成年审查页响应 A/D(原逻辑)
       if (!onMinorReview()) return;
@@ -313,8 +433,8 @@
     // 列表页(仅 character / multi_character):启用「悬停行 + A/D」,面板可见,不自动打开审查
     if (isListPage()) {
       // 进入列表页给一次操作提示(不覆盖刚发生的行决策反馈)
-      if (!/已通过|已拒绝|该行|不在任何一行/.test(currentMsg)) {
-        currentMsg = "列表页:悬停某行,A=通过 / D=拒绝";
+      if (!/已通过|已拒绝|该行|不在任何|已选中|没有可选/.test(currentMsg)) {
+        currentMsg = "列表页:↑↓ 选行看预览,A=通过 / D=拒绝";
       }
       renderPanel();
       // DOM 可能已重排(点了通过/翻页),用鼠标位置重新定位高亮行
