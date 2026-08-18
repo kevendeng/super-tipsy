@@ -1,17 +1,52 @@
 // 审核小助手
 // 列表页:自动点开最上方的「审查」。
 // 详情页:按 A=批准(通过)、D=拒绝。完成后网站自动回列表页,再自动点开下一个。
+// 未成年审查:按 S=跳过当前卡住的角色(系统繁忙无法处理的),让它留在列表最上方,
+//            脚本改从下一个开始;刷新页面后从头重审。
+// 一键驳回(未成年详情页):Q / E 是完整流程 —— 点驳回 → 勾理由 → 确认驳回 → 下一个。
+//            Q=理由「Childlike appearance」;E=理由「IP infringement」。
 
 (function () {
   "use strict";
 
-  const VERSION = "v3.6"; // 改代码时记得 +1,方便确认是否生效
+  const VERSION = "v4.0"; // 改代码时记得 +1,方便确认是否生效
   const CLICK_COOLDOWN = 1500; // 同一动作的最小间隔,防连点
   let lastReviewClickAt = 0;
   let lastDecisionAt = 0;
   let lastRowDecisionAt = 0; // 列表页「按行通过/拒绝」的防连点
   let lastUrl = location.href;
   let paused = false; // 暂停时不自动打开审查
+
+  // 未成年审查:跳过列表最上方的前 N 个(卡住/系统繁忙无法处理的角色)。
+  // 按 S 递增;卡住的角色一直留在最上方不处理,脚本改从第 N+1 个开始。
+  // 详情页是原地渲染的(back 会退过头),所以跳过时导航回“列表页 URL”,这会刷新页面。
+  // 为了让 skipCount 跨这次刷新保留、又能在“你手动刷新”时归零:
+  //   - skipCount 存 sessionStorage;
+  //   - 脚本自己导航前打一个「有意重载」标志,加载时若见到该标志就保留、否则(=手动刷新)归零。
+  const SKIP_KEY = "__rh_skip";
+  const INTENT_KEY = "__rh_intentional_nav";
+  let minorListUrl = ""; // 记住的未成年审查列表页 URL(带 ?tab=minor_review)
+  let skipCount = (function () {
+    try {
+      const nav = (performance.getEntriesByType("navigation")[0] || {}).type;
+      const intentional = sessionStorage.getItem(INTENT_KEY) === "1";
+      sessionStorage.removeItem(INTENT_KEY); // 用一次即清
+      // 手动刷新(reload)且不是脚本自己导航来的 → 从头开始
+      if (nav === "reload" && !intentional) {
+        sessionStorage.removeItem(SKIP_KEY);
+        return 0;
+      }
+      return parseInt(sessionStorage.getItem(SKIP_KEY) || "0", 10) || 0;
+    } catch (e) {
+      return 0;
+    }
+  })();
+  function setSkipCount(n) {
+    skipCount = n;
+    try {
+      sessionStorage.setItem(SKIP_KEY, String(n));
+    } catch (e) {}
+  }
 
   // 只在「未成年审查 / minor review」标签激活。
   // 列表页 URL 带 ?tab=minor_review;点开详情页可能不带 tab 参数,
@@ -22,6 +57,15 @@
       const isMinor = /minor/i.test(m[1]);
       try {
         sessionStorage.setItem("__rh_minor", isMinor ? "1" : "0");
+        // 只在“确实是列表页”(有审查按钮、不是详情页)时记 URL,且清洗成只留 tab 参数。
+        // 否则详情页(URL 也带 tab + 角色 id/状态)会覆盖成详情自己的 URL,
+        // 导航回去就还是同一个角色 —— 正是“打开原来的而不是下一个”的原因。
+        if (isMinor && !isDetailPage() && findReviewButtons().length > 0) {
+          const clean =
+            location.origin + location.pathname + "?tab=" + m[1];
+          minorListUrl = clean;
+          sessionStorage.setItem("__rh_minor_list_url", clean);
+        }
       } catch (e) {}
       return isMinor;
     }
@@ -556,6 +600,102 @@
     return false;
   }
 
+  // ---- 「驳回未成年内容审核」弹窗:勾指定理由 + 点确认驳回 ----
+  // 弹窗结构:标题「驳回未成年内容审核」,MuiFormGroup 里若干 <label>(每个含一个
+  // checkbox + 理由文字),底部「取消」+「确认驳回」;未勾选时确认驳回是 disabled。
+  function findRejectReasonDialog() {
+    const dialogs = Array.from(
+      document.querySelectorAll('[role="dialog"], .MuiDialog-paper')
+    ).filter(isVisible);
+    for (const d of dialogs) {
+      if (/驳回未成年内容审核|确认驳回|Childlike appearance/i.test(d.textContent || "")) {
+        return d;
+      }
+    }
+    return null;
+  }
+
+  // 按理由文字(不区分大小写、允许中间有别的字符)在弹窗里找对应 <label>
+  function findReasonLabel(dialog, keyword) {
+    return Array.from(dialog.querySelectorAll("label")).find((l) =>
+      new RegExp(keyword, "i").test(l.textContent || "")
+    );
+  }
+
+  // 弹窗里的「确认驳回」按钮(红色 contained;兜底按文字)
+  function findConfirmRejectButton(dialog) {
+    const byText = Array.from(dialog.querySelectorAll("button")).find((b) =>
+      /确认驳回|confirm/i.test(btnText(b))
+    );
+    if (byText) return byText;
+    return Array.from(dialog.querySelectorAll("button.MuiButton-colorError"))[0] || null;
+  }
+
+  // 完整驳回流程:详情页按 Q/E → 先点「驳回」弹出理由框 → 勾指定理由 → 等
+  // 「确认驳回」由 disabled 变可点 → 点确认 → 回列表打开下一个。
+  // keyword 用于匹配理由 <label> 文字,label 仅用于状态提示。
+  // 已有弹窗(你手动点过驳回)则跳过点驳回这步,直接勾理由。
+  function rejectWithReason(keyword, label) {
+    // 第一步:确保驳回弹窗已打开
+    if (!findRejectReasonDialog()) {
+      const rej = findRejectButton();
+      if (!rej) {
+        setStatus("当前不是详情页,找不到驳回按钮");
+        return;
+      }
+      setStatus("点驳回,等理由弹窗(" + label + ")…");
+      rej.click();
+    }
+    // 第二步:轮询等弹窗出现 → 勾理由 → 等确认驳回启用 → 点确认
+    let phase = "waitDialog"; // waitDialog → waitConfirm
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries++;
+      const dlg = findRejectReasonDialog();
+
+      if (phase === "waitDialog") {
+        if (!dlg) {
+          if (tries >= 20) {
+            clearInterval(timer); // ~2s 弹窗没出来:放弃
+            setStatus("驳回弹窗没弹出,请重试");
+          }
+          return;
+        }
+        const reason = findReasonLabel(dlg, keyword);
+        if (!reason) {
+          clearInterval(timer);
+          setStatus("弹窗里找不到「" + label + "」");
+          return;
+        }
+        // 点 label 切换 checkbox;已勾则不重复点(避免又取消勾选)
+        const cb = reason.querySelector('input[type="checkbox"]');
+        if (!cb || !cb.checked) reason.click();
+        setStatus("已勾「" + label + "」,确认驳回中…");
+        phase = "waitConfirm";
+        tries = 0; // 重新计时等确认按钮启用
+        return;
+      }
+
+      // waitConfirm:弹窗关掉 = 驳回成功
+      if (!dlg) {
+        clearInterval(timer);
+        return;
+      }
+      // 「确认驳回」由 disabled 变可点是 React 异步更新。
+      // isVisible() 含 !el.disabled,disabled 时返回 false,天然充当“已启用”判据。
+      const confirm = findConfirmRejectButton(dlg);
+      if (confirm && isVisible(confirm)) {
+        clearInterval(timer);
+        confirm.click();
+        lastReviewClickAt = 0; // 回列表后立即打开下一个
+        setStatus("❌ 已驳回(" + label + "),进入下一个…");
+      } else if (tries >= 20) {
+        clearInterval(timer); // ~2s 还没启用:交回给你手动确认
+        setStatus("确认驳回按钮未启用,请手动确认");
+      }
+    }, 100);
+  }
+
   // ---- 判定当前页面类型 ----
   // 详情页:同时存在批准(绿)和拒绝(红)按钮
   function isDetailPage() {
@@ -599,10 +739,21 @@
     }
     const btns = findReviewButtons();
     if (btns.length === 0) return;
-    // DOM 顺序 [0] 即最上方那条
+    // 跳过最上方卡住的前 skipCount 个(DOM 顺序即从上到下)。
+    // 若可见的只剩被跳过的那些(btns.length <= skipCount),说明后面的都审完了,
+    // 只剩卡住的角色 —— 不再自动打开,提示刷新重来。
+    if (skipCount >= btns.length) {
+      setStatus("仅剩已跳过的角色,刷新页面重新从头审");
+      return;
+    }
+    const idx = skipCount;
     lastReviewClickAt = now;
-    setStatus("打开第一个审查…");
-    btns[0].click();
+    setStatus(
+      idx > 0
+        ? "打开第 " + (idx + 1) + " 个审查(已跳过前 " + idx + " 个)…"
+        : "打开第一个审查…"
+    );
+    btns[idx].click();
   }
 
   function decide(kind) {
@@ -633,6 +784,22 @@
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (paused) return; // 暂停中:不响应任何快捷键,防误触
 
+      // Q / E = 一键驳回(完整流程):点驳回 → 勾理由 → 确认驳回 → 下一个。
+      //   Q = Childlike appearance、E = IP infringement。
+      // 在未成年审查详情页、或驳回弹窗已开时触发,优先于其它快捷键。
+      {
+        const kd = e.key.toLowerCase();
+        if (
+          (kd === "q" || kd === "e") &&
+          (findRejectReasonDialog() || (onMinorReview() && isDetailPage()))
+        ) {
+          e.preventDefault();
+          if (kd === "q") rejectWithReason("Childlike\\s*appearance", "Childlike appearance");
+          else rejectWithReason("IP\\s*infringement", "IP infringement");
+          return;
+        }
+      }
+
       // 列表页:↑/↓ 切换选中行并预览;A/D 对当前选中行决策
       if (isListPage()) {
         if (e.key === "ArrowDown") {
@@ -654,6 +821,33 @@
       }
 
       const k = e.key.toLowerCase();
+
+      // 未成年审查页:S = 跳过当前卡住的角色。
+      // 让它一直留在列表最上方不处理,脚本改从下一个开始;刷新页面后 skipCount 归零重来。
+      if (k === "s") {
+        if (!onMinorReview()) return;
+        e.preventDefault();
+        setSkipCount(skipCount + 1);
+        setStatus("⏭️ 已跳过,改从第 " + (skipCount + 1) + " 个开始(手动刷新可重来)");
+        lastReviewClickAt = 0; // 清冷却,回到列表后立即打开下一个
+        // 详情页是原地渲染的,history.back 会退过头 → 直接导航回“列表页 URL”。
+        // 打「有意重载」标志,让加载时保留 skipCount(区别于你手动刷新)。
+        if (isDetailPage()) {
+          let listUrl = minorListUrl;
+          try {
+            listUrl = listUrl || sessionStorage.getItem("__rh_minor_list_url");
+            sessionStorage.setItem(INTENT_KEY, "1");
+          } catch (e) {}
+          // 详情页与列表页共用同一个 URL(点“审查”是原地换 DOM,不改 URL、不压历史)。
+          // 所以导航到列表 URL 时,若目标 = 当前 URL,浏览器不会重载 → 详情一直挂着。
+          // 必须强制整页重载:重载后服务器返回干净列表,自动打开器打开第 skipCount+1 个。
+          const target = listUrl || location.href;
+          if (target !== location.href) location.href = target;
+          else location.reload();
+        }
+        return;
+      }
+
       if (k !== "a" && k !== "d") return;
 
       // 详情页:仅在未成年审查页响应 A/D(原逻辑)
